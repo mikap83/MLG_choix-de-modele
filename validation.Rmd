@@ -1,0 +1,725 @@
+---
+title: "Validation MLG et Choix de modèles"
+author: "Michele Caputo"
+date: "07/01/2022"
+output: 
+  html_document:
+    fig_width: 12
+    fig_height: 9
+    df_print: "kable"
+---
+
+```{r setup, echo = FALSE}
+knitr::opts_chunk$set(echo = TRUE, error = FALSE, message = FALSE)
+
+rm(list = ls())
+
+library(tidyverse)
+
+```
+
+
+# Introduction
+On a des observations journalières des conditions météorologiques à Bâle entre 2010 et 2018.
+
+Les colonnes correspondent aux valeurs moyenne, minimale et maximale sur la journée de:
+
+
+- Température (C)
+- Humidité relative (pourcentage)
+- Pression (hPa)
+- Nébulosité (pourcentage)
+- Nébulosité forte, moyenne et faible
+- Vitesse (en km/h) et Direction (en dégrées) du vent 
+  - à 10 m d’altitude, 
+  - 80 m d’altitude
+  - à l’altitude où la pression vaut 900 hPa
+- Rafales de vent à 10 m
+
+ainsi qu'aux valeurs totales sur la journée de:
+- Précipitations (mm)
+- Neige (cm)
+- Minutes d'ensoleillement
+- Rayonnement solaire (W/m2)
+
+
+L’idée est d'appliquer les connaissances de Choix de modèles et de modèle Linéaire Généralisé pour prédire s'il pleuvra le lendemain 
+
+## La "logique metier"
+
+La source des données est meteoblue, un service météorologique crée a l’université de Bâle, en Suisse.
+
+À l'adresse https://content.meteoblue.com/en/specifications/weather-variables ,
+meteoblue donne des explications sur les variables dans notre jeu de données, je me concentre sur celles qui 
+me semblent plus pertinentes.
+
+### Pression
+
+La pression de la colonne d'air à niveau de la mer est d'approximativement de 1013 hPa. Cette pression diminue avec l'altitude,
+donc pour pouvoir comparer les données pour des liuex qui se trouvent à différente altitude, les données sont corrigées au niveau de la mer ; dans notre cas ça ne représente pas un problème vu qu'on
+a des données relatives à la seule Bâle, mais c'est surement un facteur à tenir en compte pour des modèles couvrants une aire géographique plus importante. 
+
+Je m'attends que la pression jouera un rôle important pour mes prévisions : une baisse pression implique que moins de poids pousse vers le bas, donc l'aire monte et se refroidit, ce qui favorise la formation des nuages.
+Vice versa pour l'haute pression.
+
+Comment définit-on les niveaux de pression ? Selon https://www.theweatherprediction.com/habyhints2/410/ 
+on a :
+
+
+| Niveau     | Interprétation      | 
+|:----------:|:-------------------:|
+| 1030 hPa   | très haute pression |
+| 1013 hPa   | pression moyenne    |
+| 1000 hPa   | basse pression      |
+
+### Humidite relative
+
+L'humidité relative est un indicateur de la quantité d'eau dans l'air qui varie entre 0 (air complètement sèche)
+et 100 (air saturée).
+Elle dépend de la température et de la pression.
+
+### Precipitation
+De façon intuitive, j'avais pensé que la la position de Bâle devrait avoir un effet sur l’efficacité
+du vent à disperser les nuages. 
+
+![Basel geography. Source: https://en-gb.topographic-map.com/maps/jlz3/Basel/](images/Basel_geography.png)
+
+Sur meteoblue il est précisé que, parmi les différents types de précipitations, il y a
+les précipitations orographiques, phénomène qu'on observe quand, par exemple, les masses d'air sont
+poussés par le vent à monter le côte des montagnes.
+
+Ça pourrait être le cas pour les vents qui soufflent dans les directions Sud et Ouest.
+
+### Vent
+
+Observation très importante : la direction du vent est définie comme la direction d’où le vent vient.
+Donc un vent avec direction Nord est un vent qui vient du Nord et qui souffle vers le Sud.
+
+Une autre explication importante est celle relative à la turbulence de l'air, qui augmente 
+avec la différence entre la vitesse du vent et celle des rafales.
+
+### Nebulosité
+
+La nébulosité a un effet non négligeable sur les prévisions de la température ; pour les
+précipitations il a des mécanismes plus complexes derrière. 
+
+## Outils
+
+Pour éviter d'avoir des répétitions dans mon code, j'ai factorisé les operations communes dans les fonctions suivantes
+
+```{r utils}
+
+get_reduced_compass_direction = function(degrees) {
+  ifelse( ((degrees >= 315) | degrees < 45), "N",
+          ifelse(degrees >= 45 & degrees < 135, "E",
+                 ifelse(degrees >= 135 & degrees < 225, "S",
+                        ifelse(degrees >= 225 & degrees < 315, "W",
+                               NA))))
+}
+
+is_model_useful = function(model) {
+  pchisq(model$null.deviance - model$deviance, 
+         model$df.null - model$df.residual, lower = FALSE)
+}
+
+is_model_sufficient = function(model) {
+  pchisq(model$deviance, model$df.residual, lower = FALSE) 
+}
+
+get_model_info = function(model) {
+  model_name = deparse(substitute(model))
+  
+  # https://stackoverflow.com/a/21115433/2073934
+  predictors_number = length(all.vars(formula(model))) - 1
+  
+  return(tibble(model_name, 
+                "aic" = model$aic, 
+                "null_model_deviance" = model$null.deviance, 
+                "residual_deviance" = model$deviance, 
+                "residual_degrees_of_freedom" = model$df.residual, 
+                "null_degrees_of_freedom" = model$df.null, 
+                "number_of_predictors" = predictors_number,
+                "equivalent_to_null_model" = is_model_useful(model),
+                "equivalent_to_saturated_model" = is_model_sufficient(model)
+         ))
+}
+
+get_wrangled_weather_data = function(data) {
+  data %>% 
+    mutate(Date = as.Date(paste(Year, Month, Day, sep = "-"), 
+                          format = "%Y-%m-%d"), .before = 1) %>% 
+    mutate(Wind.Direction.daily.mean..10.m.above.gnd. =
+             as.factor(get_reduced_compass_direction(Wind.Direction.daily.mean..10.m.above.gnd.))) %>%
+    mutate(Wind.Direction.daily.mean..80.m.above.gnd. =
+             as.factor(get_reduced_compass_direction(Wind.Direction.daily.mean..80.m.above.gnd.))) %>%
+    mutate(Wind.Direction.daily.mean..900.mb. =
+             as.factor(get_reduced_compass_direction(Wind.Direction.daily.mean..900.mb.))) %>% 
+    column_to_rownames(var = "Date") %>% 
+    select(-X, -Year, -Month, -Day, -Hour, -Minute)
+}
+```
+
+
+# Exploration des donnèes
+
+```{r load_data}
+weather_data = read.csv("data/meteo.train.csv", header = TRUE)
+```
+
+Les données sont complets, pas de NA.
+
+Comme on a vu dans l’énoncé du devoir, chaque ligne est relative à un jour, ce qui explique que les variables Hour et Minute sont toujours égales à zéro. Je peux donc les enlever.
+Je vais aussi synthétiser Year-Month-Day dans un champ de type Date.
+
+A part la date, les autres variables sont numériques. Un autre manipulation envisageable est le mapping
+des dégrées du vent sur les facteurs N, S, W, E.
+
+## Preparation des donnees
+
+```{r data wrangling}
+training_weather_data = get_wrangled_weather_data(weather_data)
+
+head(training_weather_data)
+
+training_weather_data %>% 
+  select(starts_with("Wind.Direction")) %>% 
+  gather(key, value) %>% 
+  count(key, value) %>% 
+  spread(value, n, fill = 0)
+
+```
+
+## Analyse de la correlation
+
+Les variables extrêmement corrélées sont inutiles.
+Vu le nombre d'observations la matrice de corrélations est impossible à visualiser, donc je la manipulerai pour trouver plus facilement les variables fortement corrélées, selon la table empirique suivante:
+
+| valeur de $\rho$        |   niveau de la relation |
+|:-----------------------:|:-----------------------:|
+| $\rho$ \< 0.25          | Pas de relation         |
+| 0.25 \< $\rho$ \< 0.5   | Relation faible         |
+| 0.5 \< $\rho$ \< 0.75   | Relation moyenne        |
+| $\rho$ \> 0.75          | Relation forte          |
+
+
+
+```{r correlation_analysis}
+library(corrplot)
+
+# the correlation matrix is simmetric! We can take just the lower or the upper part
+# and ignore the diagonal
+
+corr_matrix = training_weather_data %>% 
+  select_if(is.numeric) %>% 
+  cor()
+
+upper = corr_matrix
+upper[upper.tri(corr_matrix, diag = TRUE)] = NA
+lower_corr_matrix = as.data.frame(upper)
+
+flat_lower_corr_matrix = lower_corr_matrix %>% 
+  rownames_to_column(var = "variable1") %>% 
+  gather(variable2, value, -variable1) %>% 
+  mutate(value = as.numeric(value))
+# le nombre d'observations est bien 41*41 = 1681
+
+high_corr_matrix = flat_lower_corr_matrix %>% 
+  filter(!is.na(value)) %>% 
+  filter(abs(value) > 0.75)
+
+```
+
+### Le graphe des fortes corrélations  
+
+L’idée est de trouver grossièrement des "clusters" de variables corrélées.
+Je vais dessiner le graphe de toutes les fortes corrélations, je me servirai des libraires tidygraph et ggraph.
+
+Pour faire ça j'aurais besoin des nœuds et des arêtes.
+
+
+``` {r create nodes and edges lists}
+# https://www.sthda.com/english/articles/33-social-network-analysis/135-network-visualization-essentials-in-r/
+
+# get distinct edges from variable 1
+nodes_from = high_corr_matrix %>% 
+  distinct(variable1) %>% 
+  rename(label = variable1)
+
+# get distinct edges from variable 2
+nodes_to = high_corr_matrix %>%
+  distinct(variable2) %>%
+  rename(label = variable2)
+
+# Join the two data to create the full nodes dataset and give a unique id to each node
+nodes = full_join(nodes_from, nodes_to, by = "label") 
+nodes = nodes %>% 
+  mutate(id = 1:nrow(nodes), .before = 1)
+
+# adding the "from" column, which contains the id of the first edge
+edges = high_corr_matrix %>% 
+  left_join(nodes, by = c("variable1" = "label")) %>% 
+  rename(from = id)
+
+# adding the "to" column, which contains the id of the first edge
+labelled_edges = edges %>% 
+  left_join(nodes, by = c("variable2" = "label")) %>% 
+  rename(to = id) %>% 
+  mutate(weight = abs(value)) 
+
+```
+
+j'ai tous les elements en place, je passe à la visualisation du graphe
+
+```{r correlation graph, warning = FALSE}
+library(tidygraph)
+library(ggraph)
+
+edges = labelled_edges %>% 
+  # don't need the labelled variables
+  select(from, to, weight)
+
+corr_graph = tbl_graph(
+  nodes = nodes, edges = edges, directed = FALSE
+)
+
+ggraph(corr_graph, layout = "graphopt") + 
+  geom_node_point() +
+  geom_edge_link(aes(width = weight)) + 
+  scale_edge_width(range = c(0.7, 1)) +
+  geom_node_text(aes(label = label), repel = TRUE) +
+  labs(edge_width = "correlation") +
+  theme_graph()
+
+```
+
+Je regarde mieux dans le composant realtif aux vents et aux rafales :
+
+```{r correlation graph focus on wind variables}
+wind_edges = labelled_edges %>% 
+  filter(str_detect(variable1, "Wind") | str_detect(variable2, "Wind")) %>% 
+  mutate_at(c("from", "to"), as.character) %>% 
+  filter(str_detect(variable1, "Direction", negate = TRUE) | 
+           str_detect(variable2, "Direction", negate = TRUE)) %>% 
+  select(from, to, weight) 
+
+wind_nodes = nodes %>% 
+  filter(str_detect(label, "Wind")) %>% 
+  filter(str_detect(label, "Direction", negate = TRUE)) %>% 
+  mutate(id = as.character(id))
+
+wind_corr_graph = tbl_graph(
+  nodes = wind_nodes, edges = wind_edges, directed = FALSE
+)
+
+ggraph(wind_corr_graph, layout = "graphopt") + 
+  geom_node_point() +
+  geom_edge_link(aes(colour = factor(from))) + 
+  scale_edge_width(range = c(0.7, 1)) +
+  geom_node_text(aes(label = label), repel = TRUE) +
+  labs(edge_width = "correlation") +
+  theme_graph() 
+```
+
+Wind.Speed.daily.mean..80.m.above.gnd est fortement correlee avec toutes les autres variables,
+sauf Wind.Speed.daily.min..900.mb. et Wind.Speed.daily.max..900.mb. .
+On va garder ces trois variables.
+
+
+### Etude de la correlation - Conclusions
+
+Le graphe des "fortes corrélations" est un graphe déconnecté avec six composants.
+On a un presque un composant par type de variable :
+1. Pression 
+2. Humidité
+3. Nébulosité et Température
+4. Vitesse du vent et rafales
+5. Direction du vent
+6. Nébulosité
+
+Pour chaque composant l'idée est de le parcourir en "touchant" le nombre minimale de nœds connectés.
+
+Pour chaque composant je choisi les éléments suivants :
+
+1. Mean.Sea.Level.Pressure.daily.mean..MSL. (clair, les trois variables sont corrélées entre eux)
+2. Relative.Humidity.daily.mean..2.m.above.gnd. (clair, les valeurs min et max sont corrélées avec la valeur moyenne)
+3. Ici il faut "suivre" les corrélations. On choisit:
+   -  Medium.Cloud.Cover.daily..mean.mid.cld.lay.
+   -  Total.Cloud.Cover.daily..mean.mid.cld.lay.
+   -  Sunshine.Duration.daily.sum..sfc.
+   -  Shortwave.Radiation.daily.sum..sfc
+   -  Temperature.daily.mean..2.m.above.gnd.
+4. Comme on avait vu, on prend:
+   -  Wind.Speed.daily.mean..80.m.above.gnd
+   -  Wind.Speed.daily.min..900.mb. 
+   -  Wind.Speed.daily.max..900.mb.
+5. Wind.Direction.daily.mean.10.m.above.gnd (clair)
+6. Total.Cloud.Cover.daily.mean..sfc. (clair)
+
+
+# Modèles et validations
+
+## Un premier modèle - correlation 
+
+Pour ce premier modèle je vais me servir des variables suggérées par l'investigation sur les corrélations 
+et de celles qui ne sont pas mentionnées dans la matrice des fortes corrélations.
+
+```{r correlation study formula}
+all_variables = names(training_weather_data)
+high_corr_variables = union(high_corr_matrix$variable1, high_corr_matrix$variable2)
+
+low_corr_variables = setdiff(all_variables, high_corr_variables) 
+
+low_corr_variables
+```
+
+A part "pluie.demain", voice les variables que je considérerai pour un premier modèle.
+
+
+```{r correlation study model}
+corr_study_formula = pluie.demain ~ 
+    Mean.Sea.Level.Pressure.daily.mean..MSL. +
+    Relative.Humidity.daily.mean..2.m.above.gnd. +
+    Medium.Cloud.Cover.daily.mean..mid.cld.lay. + 
+    Total.Cloud.Cover.daily.mean..sfc. + 
+    Sunshine.Duration.daily.sum..sfc. + 
+    Shortwave.Radiation.daily.sum..sfc. + 
+    Temperature.daily.mean..2.m.above.gnd. +
+    Wind.Speed.daily.mean..80.m.above.gnd. + 
+    Wind.Speed.daily.min..900.mb. + 
+    Wind.Speed.daily.max..900.mb. +
+
+    Total.Precipitation.daily.sum..sfc. +
+    Snowfall.amount.raw.daily.sum..sfc. +
+    High.Cloud.Cover.daily.mean..high.cld.lay. +
+    Wind.Direction.daily.mean..900.mb. +
+    Total.Cloud.Cover.daily.min..sfc. +
+    High.Cloud.Cover.daily.max..high.cld.lay. + 
+    High.Cloud.Cover.daily.min..high.cld.lay. +
+    Medium.Cloud.Cover.daily.max..mid.cld.lay. +
+    Medium.Cloud.Cover.daily.min..mid.cld.lay. +
+    Low.Cloud.Cover.daily.min..low.cld.lay.
+
+corr_study_model = glm(
+    corr_study_formula ,
+    family = binomial,
+    data = training_weather_data)
+
+summary(corr_study_model)
+```
+
+À un coup d'œil, ce modèle est utile parce que (Null deviance - Residual deviance) >> (df.null - df.residual),
+mais il n'est malheureusement pas suffisant parce que la déviance résiduelle est plus petite des dégrées de liberté.
+
+Plus formellement, j'effectue les tests des rapports de vraisemblance suivants :
+-  entre mon modèle et le modèle nul $M_0$
+-  entre mon modèle et le modèle saturé $M_{sat}$.
+
+```{r corr_study_model useful}
+pchisq(corr_study_model$null.deviance - corr_study_model$deviance, 
+       corr_study_model$df.null - corr_study_model$df.residual, lower = FALSE)
+```
+
+Cette valeur faible me permet de rejeter l'hypothèse $H_0$ d’égalité entre le modèle nul $M_0$
+et mon modèle.
+
+```{r corr_study_model sufficient}
+pchisq(corr_study_model$deviance, corr_study_model$df.residual, lower = FALSE) 
+```
+
+Bien que mon model est utile, il n'est pas suffisant. La petite p-valeur ici
+m'oblige à rejeter l’hypothèse d’égalité avec le modèle saturé $M_{sat}$.
+
+#### Analyse de la variance
+
+```{r anova corr_study}
+anova(corr_study_model, test = "LRT")
+```
+ 
+Le test d'anova m'indique qu'il y a plusieurs variables qui n'expliquent presque pas comme les données varient et il faudrait donc les supprimer.
+Combler l'écart entre la variance résiduelle à 1293.7 et les 1157 dégrées de liberté me semble difficile avec ce modèle.
+
+Maintenant j'ai bien envie de voir ce qu'il se passera avec le algorithmes de sélection des variables.
+
+## Selection des variables avec les algorithmes de selection
+
+Vu les mauvais résultats obtenus avec le modèle issu de l'analyse des corrélations, je vais regarder à ceux que je peux obtenir avec les algorithmes 
+de sélection des variables. Je ne fais aucune hypothèse à priori. 
+
+### Methode exhaustive
+Etant le nombre des covariables 40, il faudrait comparer $2^{40}$ modèles possibles.
+Je m'attend que la méthode exhaustive ne va pas aboutir, je ne parcourrai pas cette piste
+
+### Methode pas à pas
+
+Je chercherai rapidement la consistance des résultats parmi les trois méthodes ascendante, descendante et progressive.
+
+```{r selection algorithms setup}
+
+null_model = glm(
+  pluie.demain ~ 1,
+  family = binomial,
+  data = training_weather_data
+)
+
+all_vars_model = glm(
+  pluie.demain ~ .,
+  family = binomial,
+  data = training_weather_data
+)
+
+```
+
+
+#### Methode ascendante
+
+```{r forward selection}
+
+forward_model = step(
+  null_model,
+  formula(all_vars_model),
+  data = training_weather_data,
+  direction = "forward",
+  trace = FALSE
+)
+```
+
+```{r forward selection summary}
+summary(forward_model)
+```
+
+Le modèle forward_model est à préférer au modèle  corr_study_model en termes d'AIC (`r round(AIC(forward_model))` contre `r round(AIC(corr_study_model), 2)` de corr_study_model).
+Suivant la même heuristique qu'auparavant, ce modèle semble utile, mais pas suffisant :
+
+`r round(forward_model$null.deviance)` - `r round(forward_model$deviance)` >> `r round(forward_model$df.null)` - `r round(forward_model$df.residual)` => modèle utile
+
+`r round(forward_model$deviance)` > `r round(forward_model$df.null)` => je préfére le modèle saturé
+
+Plus formellement :
+
+```{r forward model useful and sufficient}
+is_model_useful(forward_model)
+
+is_model_sufficient(forward_model)
+```
+
+Ce qui confirme ce qu'on avait vu.
+
+##### Analyse de la variance
+
+```{r forward model anova}
+anova(forward_model, test = "LRT")
+```
+
+#### Methode descendante
+
+```{r backward selection}
+backward_model = step(
+  all_vars_model,
+  direction = "backward", 
+  trace = FALSE
+)
+```
+
+```{r backward selection summary}
+summary(backward_model)
+```
+
+Le modèle semble utile, mais pas suffisant. Sur la base de l'AIC, je préfére 
+ce modèle à celui trouvé avec la méthode ascendante (`r round(AIC(backward_model))` 
+contre `r round(AIC(forward_model))`) - mais la différence est minimale  
+
+Formellement :
+
+```{r backward model useful and sufficient}
+is_model_useful(backward_model)
+is_model_sufficient(backward_model)
+```
+
+#### Methode progressive
+
+```{r both directions selection, echo = FALSE}
+both_directions_model = step(
+  all_vars_model,
+  direction = "both", 
+  trace = FALSE
+)
+```
+
+```{r both directions selection summary}
+summary(both_directions_model)
+```
+
+La sortie me semble similaire à celle de la méthode descendante :
+
+```{r consistency stepwise algorithms}
+formula(backward_model) == formula(both_directions_model)
+```
+
+je ne vais pas répéter les tests que j'ai déjà fait.
+
+## Le point de la situation
+
+```{r models summary}
+
+preliminary_models_info = get_model_info(forward_model) %>% 
+  add_row(get_model_info(backward_model)) %>% 
+  add_row(get_model_info(both_directions_model) %>% 
+  add_row(get_model_info(corr_study_model))
+)
+
+preliminary_models_info
+```
+
+Les méthodes de sélection algorithmiques performent beaucoup mieux en termes de déviance résiduelle (et d'AIC).
+Il n'y a pas de convergence entre les trois méthodes pas à pas, mais backward_model et both_directions_model sont égaux, avec AIC et déviance résiduelle inférieurs à ceux du forward_model, donc je choisi le backward_model.
+
+Les deux covariables en plus permettent au backward_model de s'approcher de la p-valeur pour la quelle on ne peut pas rejeter l’hypothèse d’égalité avec le modèle saturé, mais on n'a pas atteint le seuil de 5%.
+
+## Recherche d'un modèle suffisant
+
+Je partirai du backward_model et j'ajouterai des variables derivées et des interactions, en me basant sur des intuitions liées à la logique métier.
+Pour rappel, on avait les observations suivantes :
+
+-  L'humidité relative est un indicateur de la quantité d'eau dans l'air
+-  les masses d'air poussées par le vent à monter le côte des montagnes sont à l'origine des précipitations orographiques
+-  la turbulence de l'air augmente avec la différence entre la vitesse du vent et celle des rafales. Selon https://askinglot.com/what-is-considered-a-strong-gust-of-wind on parle de : 
+    -  forte rafale quand la vitesse dépasse les 15 nœuds (~ 27 km/h) 
+    -  fort vent quand à partir de 25 mph (~ 40 km/h)
+
+Je vais donc ajouter les variables dérivées suivantes :
+
+-  forts vents
+-  fortes rafales
+-  différence entre vitesse moyenne à 10 métres et vitesse moyenne des rafales
+
+et les interactions suivantes :
+
+-  température et pression
+-  humidité relative avec vitesse du vent et direction du vent (précipitations orographiques)
+
+
+```{r backward model with interactions}
+
+backward_model_interactions =
+  update(backward_model, ~ .
+    # air turbulence
+    + I(Wind.Gust.daily.mean..sfc. > 27)  # strong gusts
+       + I(Wind.Speed.daily.max..10.m.above.gnd. > 40)  # strong winds 
+       + I(abs(Wind.Speed.daily.mean..10.m.above.gnd. - Wind.Gust.daily.mean..sfc.)) 
+       # end air turbulence
+       
+       + Relative.Humidity.daily.mean..2.m.above.gnd. : Wind.Speed.daily.mean..10.m.above.gnd. : Wind.Direction.daily.mean..10.m.above.gnd.
+       + Temperature.daily.mean..2.m.above.gnd. : Mean.Sea.Level.Pressure.daily.mean..MSL. 
+)
+
+summary(backward_model_interactions)
+```
+
+Très bien : dans le cas précédent on avait an AIC de `r round(AIC(backward_model), 2)` et une deviance residuelle de `r round(backward_model$deviance, 2)``. 
+
+```{r backward model with interactions useful sufficient}
+is_model_useful(backward_model_interactions)
+is_model_sufficient(backward_model_interactions)
+```
+
+Enfin, j'obtiens un modèle utile et suffisant. 
+
+Je me sers du test anova pour voir si je peux le simplifier. Déjà il faut noter que, indépendamment de la direction du vent, quand l'humidité et la vitesse du vent augmentent, augmente aussi la probabilité de pluie. Je peux supprimer l'interaction avec la direction du vent.
+
+```{r backward model interactions anova}
+anova(backward_model_interactions, test = "LRT")
+```
+
+La sortie d'anova me donne envie de supprimer en premier I(abs(Wind.Speed.daily.mean..10.m.above.gnd. - Wind.Gust.daily.mean..sfc.)). 
+
+```{r}
+backward_model_interactions_simplified =
+  update(backward_model, ~ .
+    # air turbulence
+    + I(Wind.Gust.daily.mean..sfc. > 27)  # strong gusts
+    + I(Wind.Speed.daily.max..10.m.above.gnd. > 40)  # strong winds 
+    # end air turbulence
+    + Relative.Humidity.daily.mean..2.m.above.gnd. : Wind.Speed.daily.mean..80.m.above.gnd. 
+    + Temperature.daily.mean..2.m.above.gnd. : Mean.Sea.Level.Pressure.daily.mean..MSL.
+)
+
+summary(backward_model_interactions_simplified)
+```
+
+La déviance résiduelle reste presque la même, mais l'AIC passe de `r round(AIC(backward_model_interactions), 2)` à `r round(AIC(backward_model_interactions_simplified), 2)`, avec `r length(all.vars(formula(backward_model_interactions_simplified))) - 1` covariables 
+(en lieu de `r length(all.vars(formula(backward_model_interactions))) - 1`)
+
+```{r}
+is_model_useful(backward_model_interactions_simplified)
+is_model_sufficient(backward_model_interactions_simplified)
+```
+
+le modèle reste utile et suffisant
+
+```{r}
+anova(backward_model_interactions_simplified, backward_model_interactions, test = "LRT")
+```
+
+Je n'ai pas d’évidence statistique pour rejeter l’hypothèse d’égalité entre le modèle backward_model_interactions et le modèle emboîté backward_model_interactions_simplified : je garde ce dernier.
+
+# Analyse des performances
+
+Pour mesurer l’adéquation de mes modèles, je choisi la validation croisée. Vue la nature du problème, j'opte pour une fonction de perte 0-1, je n'ai aucun intérêt spécifique à vouloir pénaliser les erreurs lorsque $\hat{p}_i$ s'éloigne de 0.5
+
+```{r k-fold validation}
+k = 10
+index = sample(1:k, nrow(training_weather_data), replace=T)
+
+prediction_results = rep(NA, k)
+
+for(fold in 1:k){
+  current_fold_logistic_regression = glm(
+    backward_model_interactions_simplified[["formula"]],
+    family = binomial,
+    data = training_weather_data[index != fold, ]
+  )
+
+  current_fold_predictions =
+    predict(current_fold_logistic_regression, newdata = training_weather_data[index == fold, ],
+            type="response")
+
+  prediction_results[fold] = mean(training_weather_data[index == fold, "pluie.demain"] == (current_fold_predictions > .5))
+
+}
+
+mean(prediction_results)
+```
+
+# Considerations finales
+
+En conclusion de ce rapport, je montre une vue synthétique de tous les modèles que j'ai examiné.
+
+```{r final considerations}
+
+preliminary_models_info %>% 
+  add_row(get_model_info(backward_model_interactions)) %>% 
+  add_row(get_model_info(backward_model_interactions_simplified))
+
+```
+
+Pour aller plus loin, il serait intéressant de continuer de découvrir des nouvelles interactions et/ou certains seuils aussi en collaboration des experts du domaine. 
+
+# Prédictions finales
+
+Je génére enfin les prédiction pour l'ensemble de test donné :
+
+```{r test set predictions}
+test_weather_data = read.csv("data/meteo.test.csv", header = TRUE) %>% 
+  get_wrangled_weather_data()
+
+test_predictions = predict(backward_model_interactions_simplified, 
+                           newdata = test_weather_data, 
+                           type = "response") > 0.5 
+
+preds = data.frame(Date = names(test_predictions), pluie.demain = test_predictions)
+
+write.csv(preds, "data/meteo.predictions.csv", row.names = FALSE)
+```
+
+
+
